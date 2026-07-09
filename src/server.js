@@ -6,9 +6,10 @@ import os from "os";
 
 // Import your custom modules (Ensure these files use 'export' instead of 'module.exports')
 import { createSocketConnection, testSocketConnection, setSocketPortUser, broadcastTelemetryToUser, getSocketPortUser, hasSocketServer, getActivePortAllocationsCount, getActiveSocketServersCount, getSocketPortUserMap } from "./createSocketConnection.js";
-import { testDatabaseConnection, insertTelemetryWithConcurrencyControl, insertMQTTTelemetryData, userExists, deviceBelongsToUser, getLatestTelemetryForDevice, getUsernameForDevice } from "./database.js";
+import { testDatabaseConnection, insertTelemetryWithConcurrencyControl, insertMQTTTelemetryData, userExists, deviceBelongsToUser, getLatestTelemetryForDevice, getUsernameForDevice, registerUser, getUserByEmail, registerDevice, deviceBelongsToUserId, getUserIdByDeviceId, insertTelemetryByDeviceId, getLatestTelemetryByDeviceId } from "./database.js";
 import { connectToMQTT, publishToMQTT, subscribeToMQTT } from "./connectToMQTT.js";
 import { logUserConnection, logServiceFailure, logCritical, logInfo, logError, generateSystemReport } from "./logger.js";
+import { authenticateToken, generateToken } from "./authMiddleware.js";
 
 // Fix for __dirname in ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -79,26 +80,32 @@ async function lookForAvailablePort(startPort, maxAttempts = 10) {
     throw new Error("No available ports found in the specified range.");
 }
 
-app.post('/createSocket', async (request, response) => {
+app.post('/createSocket', authenticateToken, async (request, response) => {
     try {
-        const { username } = request.body;
+        const { userId } = request.body;
 
-        if (!username) {
+        if (!userId) {
             return response.status(400).json({
-                error: "Missing required field: 'username' is required."
+                error: "Missing required field: 'userId' is required."
             });
         }
 
-        const START_PORT_RANGE = 4000;
-        const availablePort = await lookForAvailablePort(START_PORT_RANGE);
+        // Verify the authenticated user matches the userId in the request
+        if (request.userId !== parseInt(userId)) {
+            return response.status(403).json({
+                error: "Unauthorized. You can only create sockets for your own account."
+            });
+        }
 
-        createSocketConnection(availablePort, { username });
-        logUserConnection(username, availablePort, 'socket connection created via API');
+        // Default to port 443 for Render environments as per spec
+        const port = 443;
+
+        createSocketConnection(port, { userId });
+        logUserConnection(userId, port, 'socket connection created via API');
 
         return response.status(201).json({
-            message: "Socket connection successfully initialized",
-            username,
-            assignedPort: availablePort
+            success: true,
+            port
         });
     } catch (error) {
         console.error("Error creating socket:", error.message);
@@ -109,23 +116,28 @@ app.post('/createSocket', async (request, response) => {
     }
 });
 
-app.post('/registerSocketPort', (request, response) => {
+app.post('/registerSocketPort', authenticateToken, (request, response) => {
     try {
-        const { port, username } = request.body;
+        const { userId, port } = request.body;
 
-        if (!port || !username) {
+        if (!userId || !port) {
             return response.status(400).json({
-                error: "Both 'port' and 'username' are required."
+                error: "Both 'userId' and 'port' are required."
             });
         }
 
-        setSocketPortUser(port, username);
-        logUserConnection(username, port, 'socket port registered via API');
+        // Verify the authenticated user matches the userId in the request
+        if (request.userId !== parseInt(userId)) {
+            return response.status(403).json({
+                error: "Unauthorized. You can only register sockets for your own account."
+            });
+        }
+
+        setSocketPortUser(port, userId);
+        logUserConnection(userId, port, 'socket port registered via API');
 
         return response.status(200).json({
-            message: 'Socket port registered for user successfully.',
-            port,
-            username
+            success: true
         });
     } catch (error) {
         console.error('Error registering socket port:', error.message);
@@ -137,49 +149,52 @@ app.post('/registerSocketPort', (request, response) => {
 });
 app.get('/health/db', async (_request, response) => {
     try {
-        const result = await testDatabaseConnection();
+        await testDatabaseConnection();
         databaseHealth = 'CONNECTED';
-        return response.status(200).json({ ok: true, result });
+        return response.status(200).json({ 
+            status: 'healthy', 
+            database: 'connected' 
+        });
     } catch (error) {
         databaseHealth = 'DISCONNECTED';
         logServiceFailure('Database', error);
-        return response.status(503).json({ ok: false, error: error.message });
+        return response.status(503).json({ 
+            status: 'unhealthy', 
+            database: 'disconnected' 
+        });
     }
 });
 app.post('/telemetry', async (request, response) => {
     try {
-        const { username, temperature, humidity, light_status, deviceMacAddress } = request.body;
+        const { deviceId, temperature, humidity, timestamp } = request.body;
 
-        if (!username || !deviceMacAddress || temperature === undefined || humidity === undefined) {
-            return response.status(400).json({ error: 'username, deviceMacAddress, temperature, and humidity are required.' });
+        if (!deviceId || temperature === undefined || humidity === undefined) {
+            return response.status(400).json({ error: 'deviceId, temperature, and humidity are required.' });
         }
 
-        const belongsToUser = await deviceBelongsToUser(username, deviceMacAddress);
-        if (!belongsToUser) {
-            return response.status(403).json({ error: 'Device is not registered for this username.' });
-        }
-
-        const result = await insertTelemetryWithConcurrencyControl({
+        const result = await insertTelemetryByDeviceId({
+            deviceId,
             temperature,
             humidity,
-            light_status: light_status || 'OFF',
-            deviceMacAddress
+            timestamp: timestamp || new Date().toISOString()
         });
 
-        const telemetryPayload = {
-            username,
-            deviceMacAddress,
-            temperature,
-            humidity,
-            light_status: light_status || 'OFF',
-            timestamp: new Date().toISOString()
-        };
-        broadcastTelemetryToUser(username, telemetryPayload);
+        // Get userId for this device to broadcast telemetry
+        const userId = await getUserIdByDeviceId(deviceId);
+        if (userId) {
+            const telemetryPayload = {
+                deviceId,
+                temperature,
+                humidity,
+                timestamp: timestamp || new Date().toISOString()
+            };
+            broadcastTelemetryToUser(userId, telemetryPayload);
+        }
 
-        return response.status(201).json({ ok: true, data: result });
+        return response.status(201).json({ status: 'logged' });
     } catch (error) {
         console.error('Telemetry insert failed:', error.message);
-        return response.status(500).json({ ok: false, error: error.message });
+        return response.status(500).json({ error: error.message });
     }
 });
 app.post('/testSocket', async (request, response) => {
@@ -202,21 +217,58 @@ app.post('/testSocket', async (request, response) => {
         });
     }
 });
-app.post('/checkUserExists', async (request, response) => {
+// POST /register - Register a new user
+app.post('/register', async (request, response) => {
     try {
-        const { username, phoneNumber } = request.body;
+        const { username, email, password } = request.body;
 
-        if (!username && !phoneNumber) {
+        if (!username || !email || !password) {
             return response.status(400).json({
-                error: "At least one of 'username' or 'phoneNumber' is required."
+                error: "username, email, and password are required."
             });
         }
 
-        const exists = await userExists({ username, phoneNumber });
+        const result = await registerUser({ username, email, password });
+
+        if (!result.success) {
+            return response.status(400).json({
+                error: result.message
+            });
+        }
+
+        const token = generateToken(result.userId);
+
+        return response.status(201).json({
+            success: true,
+            userId: result.userId,
+            token
+        });
+    } catch (error) {
+        console.error('User registration failed:', error.message);
+        return response.status(500).json({
+            error: "Server Error. Failed to register user",
+            details: error.message
+        });
+    }
+});
+
+// POST /checkUserExists - Check if email is already registered
+app.post('/checkUserExists', async (request, response) => {
+    try {
+        const { email } = request.body;
+
+        if (!email) {
+            return response.status(400).json({
+                error: "email is required."
+            });
+        }
+
+        const user = await getUserByEmail(email);
+        const exists = user !== null;
+
         return response.status(200).json({
             exists,
-            username: username || undefined,
-            phoneNumber: phoneNumber || undefined
+            userId: exists ? user.user_id : null
         });
     } catch (error) {
         console.error('User existence check failed:', error.message);
@@ -226,28 +278,70 @@ app.post('/checkUserExists', async (request, response) => {
         });
     }
 });
-app.post("/publishToMQTT", (request, response) => {
+
+// POST /registerDevice - Pair a new device to a user
+app.post('/registerDevice', authenticateToken, async (request, response) => {
     try {
-        const { publishTopic, publishMessage } = request.body;
-        if (!publishTopic || !MQTT_TOPICS.includes(publishTopic)) {
-            return response.status(400).json({ error: "Invalid MQTT topic" });
+        const { userId, deviceId, deviceName, deviceType } = request.body;
+
+        if (!userId || !deviceId || !deviceName || !deviceType) {
+            return response.status(400).json({
+                error: "userId, deviceId, deviceName, and deviceType are required."
+            });
         }
 
-        if (publishMessage === undefined || publishMessage === null) {
-            return response.status(400).json({ error: "publishMessage is required" });
+        // Verify the authenticated user matches the userId in the request
+        if (request.userId !== parseInt(userId)) {
+            return response.status(403).json({
+                error: "Unauthorized. You can only register devices for your own account."
+            });
+        }
+
+        const result = await registerDevice({ userId, deviceId, deviceName, deviceType });
+
+        if (!result.success) {
+            return response.status(400).json({
+                error: result.message
+            });
+        }
+
+        return response.status(201).json({
+            success: true,
+            device: result.device
+        });
+    } catch (error) {
+        console.error('Device registration failed:', error.message);
+        return response.status(500).json({
+            error: "Server Error. Failed to register device",
+            details: error.message
+        });
+    }
+});
+
+app.post("/publishToMQTT", authenticateToken, (request, response) => {
+    try {
+        const { userId, topic, command } = request.body;
+
+        if (!userId || !topic || !command) {
+            return response.status(400).json({ error: "userId, topic, and command are required" });
+        }
+
+        // Verify the authenticated user matches the userId in the request
+        if (request.userId !== parseInt(userId)) {
+            return response.status(403).json({
+                error: "Unauthorized. You can only publish for your own account."
+            });
         }
 
         if (!client) {
             return response.status(503).json({ error: "MQTT client is not connected" });
         }
 
-        publishToMQTT(client, publishTopic, publishMessage);
-        latestTopicMessages.set(publishTopic, publishMessage);
+        publishToMQTT(client, topic, command);
+        latestTopicMessages.set(topic, command);
 
         return response.status(200).json({
-            message: "Message published successfully",
-            topic: publishTopic,
-            payload: publishMessage
+            published: true
         });
     } catch (error) {
         console.error("Error publishing to MQTT:", error.message);
@@ -295,47 +389,23 @@ app.get('/admin/reports', async (_request, response) => {
 
 app.post("/getSubscribedTopicData", async (request, response) => {
     try {
-        const { topic, username, deviceMacAddress } = request.body;
+        const { topic } = request.body;
 
-        if (!topic || !username || !deviceMacAddress) {
-            return response.status(400).json({ error: "topic, username, and deviceMacAddress are required." });
-        }
-
-        if (!MQTT_TOPICS.includes(topic)) {
-            return response.status(400).json({ 
-                error: `Invalid MQTT topic: '${topic}'. The topic must match one configured in your environment variables.` 
-            });
-        }
-
-        const belongsToUser = await deviceBelongsToUser(username, deviceMacAddress);
-        if (!belongsToUser) {
-            return response.status(403).json({ error: 'Device is not registered for this username.' });
+        if (!topic) {
+            return response.status(400).json({ error: "topic is required." });
         }
 
         const latestMessage = latestTopicMessages.get(topic);
         if (latestMessage !== undefined) {
             return response.status(200).json({
                 topic,
-                payload: latestMessage,
-                source: 'mqtt',
-                timestamp: new Date().toISOString()
+                lastState: typeof latestMessage === 'string' ? latestMessage : JSON.stringify(latestMessage)
             });
         }
 
-        const latestTelemetry = await getLatestTelemetryForDevice(deviceMacAddress);
-        if (!latestTelemetry) {
-            return response.status(404).json({
-                topic,
-                payload: null,
-                message: 'No MQTT telemetry and no database telemetry found for this device.'
-            });
-        }
-
-        return response.status(200).json({
+        return response.status(404).json({
             topic,
-            payload: latestTelemetry,
-            source: 'database',
-            timestamp: latestTelemetry.created_at
+            lastState: null
         });
     } catch (error) {
         console.error("Error fetching subscribed topic data:", error.message);
