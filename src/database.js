@@ -1,46 +1,33 @@
 import dotenv from 'dotenv';
-import mysql from 'mysql2/promise';
+import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import { logServiceFailure, logServiceRecovery, logError } from './logger.js';
 
 dotenv.config();
 
-const pool = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: (process.env.DB_PASSWORD || '').trim(),
-    database: process.env.DB_NAME || 'SmartHome',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-    connectTimeout: 10000,
-    enableKeepAlive: true,
-    keepAliveInitialDelay: 0,
-    timezone: 'Z',
-    decimalNumbers: true
+const { Pool } = pg;
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/SmartHome',
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
 });
 
 // Monitor pool connection errors
-pool.on('connection', (connection) => {
+pool.on('connect', () => {
     logServiceRecovery('Database');
 });
 
-pool.on('acquire', (connection) => {
-    // Connection acquired from pool
-});
-
-pool.on('release', (connection) => {
-    // Connection released back to pool
-});
-
-pool.on('enqueue', () => {
-    logError('Database connection pool waiting for available connection');
+pool.on('error', (err) => {
+    logError('Database pool error', err);
 });
 
 export async function testDatabaseConnection() {
     try {
-        const [rows] = await pool.query('SELECT 1 AS ok');
-        return rows[0];
+        const result = await pool.query('SELECT 1 AS ok');
+        return result.rows[0];
     } catch (error) {
         logServiceFailure('Database', error);
         throw error;
@@ -48,19 +35,18 @@ export async function testDatabaseConnection() {
 }
 
 export async function withTransaction(callback) {
-    const connection = await pool.getConnection();
+    const client = await pool.connect();
 
     try {
-        await connection.query('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
-        await connection.beginTransaction();
-        const result = await callback(connection);
-        await connection.commit();
+        await client.query('BEGIN');
+        const result = await callback(client);
+        await client.query('COMMIT');
         return result;
     } catch (error) {
-        await connection.rollback();
+        await client.query('ROLLBACK');
         throw error;
     } finally {
-        connection.release();
+        client.release();
     }
 }
 
@@ -80,24 +66,24 @@ function validateLightStatus(light_status) {
 export async function insertTelemetryWithConcurrencyControl(payload) {
     const { temperature, humidity, light_status, deviceMacAddress } = payload;
 
-    return withTransaction(async (connection) => {
-        const [deviceRows] = await connection.query(
-            'SELECT device_mac_address FROM microcontroller WHERE device_mac_address = ?',
+    return withTransaction(async (client) => {
+        const deviceResult = await client.query(
+            'SELECT device_mac_address FROM microcontroller WHERE device_mac_address = $1',
             [deviceMacAddress]
         );
 
-        if (!deviceRows.length) {
+        if (!deviceResult.rows.length) {
             throw new Error(`Unknown device: ${deviceMacAddress}`);
         }
 
         const validatedLightStatus = validateLightStatus(light_status);
 
-        const [result] = await connection.query(
-            'INSERT INTO telemetry (temperature, humidity, light_status, device_mac_address) VALUES (?, ?, ?, ?)',
+        const result = await client.query(
+            'INSERT INTO telemetry (temperature, humidity, light_status, device_mac_address) VALUES ($1, $2, $3, $4) RETURNING id',
             [temperature, humidity, validatedLightStatus, deviceMacAddress]
         );
 
-        return { insertedId: result.insertId };
+        return { insertedId: result.rows[0].id };
     });
 }
 
@@ -109,12 +95,12 @@ export async function insertMQTTTelemetryData(payload) {
         return { success: false, message: 'deviceMacAddress is required' };
     }
 
-    const [deviceRows] = await pool.query(
-        'SELECT device_mac_address FROM microcontroller WHERE device_mac_address = ?',
+    const deviceResult = await pool.query(
+        'SELECT device_mac_address FROM microcontroller WHERE device_mac_address = $1',
         [deviceMacAddress]
     );
 
-    if (!deviceRows.length) {
+    if (!deviceResult.rows.length) {
         return { success: false, message: `Unknown device: ${deviceMacAddress}` };
     }
 
@@ -124,11 +110,11 @@ export async function insertMQTTTelemetryData(payload) {
 
     try {
         const validatedLightStatus = validateLightStatus(light_status);
-        const [result] = await pool.query(
-            'INSERT INTO telemetry (temperature, humidity, light_status, device_mac_address) VALUES (?, ?, ?, ?)',
+        const result = await pool.query(
+            'INSERT INTO telemetry (temperature, humidity, light_status, device_mac_address) VALUES ($1, $2, $3, $4) RETURNING id',
             [temperature, humidity, validatedLightStatus, deviceMacAddress]
         );
-        return { success: true, insertedId: result.insertId };
+        return { success: true, insertedId: result.rows[0].id };
     } catch (error) {
         console.error('Failed to insert MQTT telemetry:', error.message);
         return { success: false, message: error.message };
@@ -140,12 +126,12 @@ export async function deviceBelongsToUser(username, deviceMacAddress) {
         return false;
     }
 
-    const [rows] = await pool.query(
-        'SELECT 1 FROM microcontroller WHERE username = ? AND device_mac_address = ? LIMIT 1',
+    const result = await pool.query(
+        'SELECT 1 FROM microcontroller WHERE username = $1 AND device_mac_address = $2 LIMIT 1',
         [username, deviceMacAddress]
     );
 
-    return rows.length > 0;
+    return result.rows.length > 0;
 }
 
 export async function getLatestTelemetryForDevice(deviceMacAddress) {
@@ -153,12 +139,12 @@ export async function getLatestTelemetryForDevice(deviceMacAddress) {
         return null;
     }
 
-    const [rows] = await pool.query(
-        'SELECT temperature, humidity, light_status, device_mac_address AS deviceMacAddress, created_at FROM telemetry WHERE device_mac_address = ? ORDER BY created_at DESC LIMIT 1',
+    const result = await pool.query(
+        'SELECT temperature, humidity, light_status, device_mac_address AS "deviceMacAddress", created_at FROM telemetry WHERE device_mac_address = $1 ORDER BY created_at DESC LIMIT 1',
         [deviceMacAddress]
     );
 
-    return rows.length ? rows[0] : null;
+    return result.rows.length ? result.rows[0] : null;
 }
 
 export async function getUsernameForDevice(deviceMacAddress) {
@@ -166,12 +152,12 @@ export async function getUsernameForDevice(deviceMacAddress) {
         return null;
     }
 
-    const [rows] = await pool.query(
-        'SELECT username FROM microcontroller WHERE device_mac_address = ? LIMIT 1',
+    const result = await pool.query(
+        'SELECT username FROM microcontroller WHERE device_mac_address = $1 LIMIT 1',
         [deviceMacAddress]
     );
 
-    return rows.length ? rows[0].username : null;
+    return result.rows.length ? result.rows[0].username : null;
 }
 
 export async function userExists(userDetails = {}) {
@@ -183,19 +169,21 @@ export async function userExists(userDetails = {}) {
 
     let query = 'SELECT username FROM users WHERE 1 = 1';
     const values = [];
+    let paramCounter = 1;
 
     if (username) {
-        query += ' AND username = ?';
+        query += ` AND username = $${paramCounter}`;
         values.push(username);
+        paramCounter++;
     }
 
     if (phoneNumber) {
-        query += ' AND phone_number = ?';
+        query += ` AND phone_number = $${paramCounter}`;
         values.push(phoneNumber);
     }
 
-    const [rows] = await pool.query(query, values);
-    return rows.length > 0;
+    const result = await pool.query(query, values);
+    return result.rows.length > 0;
 }
 
 export async function saveUserRecord(userDetails = {}) {
@@ -219,9 +207,9 @@ export async function saveUserRecord(userDetails = {}) {
     }
 
     try {
-        await withTransaction(async (connection) => {
-            await connection.query(
-                'INSERT INTO users (username, password, fname, lname, gender_id, location, phone_number) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        await withTransaction(async (client) => {
+            await client.query(
+                'INSERT INTO users (username, password, fname, lname, gender_id, location, phone_number) VALUES ($1, $2, $3, $4, $5, $6, $7)',
                 [username, password, fname || null, lname || null, genderId || null, location || null, phoneNumber || null]
             );
         });
@@ -233,7 +221,6 @@ export async function saveUserRecord(userDetails = {}) {
     }
 }
 
-// New functions for API spec compliance
 export async function registerUser(userDetails = {}) {
     const {
         username,
@@ -245,25 +232,24 @@ export async function registerUser(userDetails = {}) {
         return { success: false, message: 'Username, email, and password are required.' };
     }
 
-    // Check if user already exists by email
-    const [existingRows] = await pool.query(
-        'SELECT user_id FROM users WHERE email = ? OR username = ?',
+    const existingResult = await pool.query(
+        'SELECT user_id FROM users WHERE email = $1 OR username = $2',
         [email, username]
     );
 
-    if (existingRows.length > 0) {
+    if (existingResult.rows.length > 0) {
         return { success: false, message: 'User with this email or username already exists.' };
     }
 
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         
-        const [result] = await pool.query(
-            'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+        const result = await pool.query(
+            'INSERT INTO users (username, email, password) VALUES ($1, $2, $3) RETURNING user_id',
             [username, email, hashedPassword]
         );
 
-        return { success: true, userId: result.insertId };
+        return { success: true, userId: result.rows[0].user_id };
     } catch (error) {
         console.error('Failed to register user:', error.message);
         return { success: false, message: 'Failed to register user.' };
@@ -275,12 +261,12 @@ export async function getUserByEmail(email) {
         return null;
     }
 
-    const [rows] = await pool.query(
-        'SELECT user_id, username, email, password FROM users WHERE email = ? LIMIT 1',
+    const result = await pool.query(
+        'SELECT user_id, username, email, password FROM users WHERE email = $1 LIMIT 1',
         [email]
     );
 
-    return rows.length ? rows[0] : null;
+    return result.rows.length ? result.rows[0] : null;
 }
 
 export async function getUserById(userId) {
@@ -288,12 +274,12 @@ export async function getUserById(userId) {
         return null;
     }
 
-    const [rows] = await pool.query(
-        'SELECT user_id, username, email FROM users WHERE user_id = ? LIMIT 1',
+    const result = await pool.query(
+        'SELECT user_id, username, email FROM users WHERE user_id = $1 LIMIT 1',
         [userId]
     );
 
-    return rows.length ? rows[0] : null;
+    return result.rows.length ? result.rows[0] : null;
 }
 
 export async function registerDevice(deviceDetails = {}) {
@@ -308,25 +294,23 @@ export async function registerDevice(deviceDetails = {}) {
         return { success: false, message: 'userId, deviceId, deviceName, and deviceType are required.' };
     }
 
-    // Check if user exists
     const user = await getUserById(userId);
     if (!user) {
         return { success: false, message: 'User not found.' };
     }
 
-    // Check if device already exists
-    const [existingDevice] = await pool.query(
-        'SELECT device_id FROM microcontroller WHERE device_id = ? LIMIT 1',
+    const existingDevice = await pool.query(
+        'SELECT device_id FROM microcontroller WHERE device_id = $1 LIMIT 1',
         [deviceId]
     );
 
-    if (existingDevice.length > 0) {
+    if (existingDevice.rows.length > 0) {
         return { success: false, message: 'Device with this ID already exists.' };
     }
 
     try {
-        const [result] = await pool.query(
-            'INSERT INTO microcontroller (device_id, user_id, device_name, device_type) VALUES (?, ?, ?, ?)',
+        const result = await pool.query(
+            'INSERT INTO microcontroller (device_id, user_id, device_name, device_type) VALUES ($1, $2, $3, $4) RETURNING id',
             [deviceId, userId, deviceName, deviceType]
         );
 
@@ -337,7 +321,7 @@ export async function registerDevice(deviceDetails = {}) {
                 userId, 
                 deviceName, 
                 deviceType,
-                id: result.insertId 
+                id: result.rows[0].id 
             } 
         };
     } catch (error) {
@@ -351,12 +335,12 @@ export async function deviceBelongsToUserId(userId, deviceId) {
         return false;
     }
 
-    const [rows] = await pool.query(
-        'SELECT 1 FROM microcontroller WHERE user_id = ? AND device_id = ? LIMIT 1',
+    const result = await pool.query(
+        'SELECT 1 FROM microcontroller WHERE user_id = $1 AND device_id = $2 LIMIT 1',
         [userId, deviceId]
     );
 
-    return rows.length > 0;
+    return result.rows.length > 0;
 }
 
 export async function getUserIdByDeviceId(deviceId) {
@@ -364,12 +348,12 @@ export async function getUserIdByDeviceId(deviceId) {
         return null;
     }
 
-    const [rows] = await pool.query(
-        'SELECT user_id FROM microcontroller WHERE device_id = ? LIMIT 1',
+    const result = await pool.query(
+        'SELECT user_id FROM microcontroller WHERE device_id = $1 LIMIT 1',
         [deviceId]
     );
 
-    return rows.length ? rows[0].user_id : null;
+    return result.rows.length ? result.rows[0].user_id : null;
 }
 
 export async function insertTelemetryByDeviceId(payload) {
@@ -379,22 +363,22 @@ export async function insertTelemetryByDeviceId(payload) {
         throw new Error('deviceId is required');
     }
 
-    const [deviceRows] = await pool.query(
-        'SELECT device_id FROM microcontroller WHERE device_id = ?',
+    const deviceResult = await pool.query(
+        'SELECT device_id FROM microcontroller WHERE device_id = $1',
         [deviceId]
     );
 
-    if (!deviceRows.length) {
+    if (!deviceResult.rows.length) {
         throw new Error(`Unknown device: ${deviceId}`);
     }
 
-    const validatedLightStatus = 'OFF'; // Default for new schema
-    const [result] = await pool.query(
-        'INSERT INTO telemetry (temperature, humidity, light_status, device_id) VALUES (?, ?, ?, ?)',
+    const validatedLightStatus = 'OFF'; 
+    const result = await pool.query(
+        'INSERT INTO telemetry (temperature, humidity, light_status, device_id) VALUES ($1, $2, $3, $4) RETURNING id',
         [temperature, humidity, validatedLightStatus, deviceId]
     );
 
-    return { insertedId: result.insertId };
+    return { insertedId: result.rows[0].id };
 }
 
 export async function getLatestTelemetryByDeviceId(deviceId) {
@@ -402,12 +386,12 @@ export async function getLatestTelemetryByDeviceId(deviceId) {
         return null;
     }
 
-    const [rows] = await pool.query(
-        'SELECT temperature, humidity, light_status, device_id AS deviceId, created_at FROM telemetry WHERE device_id = ? ORDER BY created_at DESC LIMIT 1',
+    const result = await pool.query(
+        'SELECT temperature, humidity, light_status, device_id AS "deviceId", created_at FROM telemetry WHERE device_id = $1 ORDER BY created_at DESC LIMIT 1',
         [deviceId]
     );
 
-    return rows.length ? rows[0] : null;
+    return result.rows.length ? result.rows[0] : null;
 }
 
 export default pool;
